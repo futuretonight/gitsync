@@ -1,0 +1,69 @@
+# GitSync Ultra — auto-generated .gitignore
+# Generated: 28-06-2026 14:13:06.93
+
+# ── GitSync internal files ─────────────────────────────
+.gitsync_cache.log
+.gitsync_config.ini
+.gitsync_backups/
+.gitsync_templates/
+
+# ── OS Files ────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ── Editor / IDE ────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.sublime-project
+*.sublime-workspace
+.vs/
+nbproject/
+
+# ── Logs and temp ───────────────────────────────────────
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# ── Build artifacts ─────────────────────────────────────
+/dist/
+/build/
+/out/
+/target/
+*.class
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+
+# ── Dependencies ────────────────────────────────────────
+/node_modules/
+/vendor/
+/.bundle/
+
+# ── Environment / Secrets ───────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets.json
+
+# ── Archives ────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.rar
+*.7z

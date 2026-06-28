@@ -28,6 +28,7 @@ set "BACKUP_DIR=.gitsync_backups"
 set "TEMPLATE_DIR=.gitsync_templates"
 set "DEFAULT_BRANCH=main"
 set "MAX_LOG_ENTRIES=500"
+set "GIT_PAGER=cat"
 set "DIVIDER==================================================================="
 set "THIN_DIVIDER=-------------------------------------------------------------------"
 set "STAR_LINE=***********************************************************"
@@ -231,7 +232,7 @@ echo %C_CYAN%[i] %~1%C_RESET%
 exit /b 0
 
 :PrintStep
-echo %C_MAGENTA%[>] %~1%C_RESET%
+echo %C_MAGENTA%[^>] %~1%C_RESET%
 exit /b 0
 
 :PrintDim
