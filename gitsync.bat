@@ -542,34 +542,47 @@ if errorlevel 1 (
     call :PrintInfo "Remote origin: !_url!"
 )
 
-:: Offer to pull first to avoid conflicts
-echo.
-set /p "_pull_first=Pull from remote first to sync? (recommended) (y/n): "
-if /i "!_pull_first!"=="y" (
-    call :PrintStep "Pulling from remote..."
-    git pull --rebase origin 2>nul
-    if errorlevel 1 (
-        call :PrintWarning "Pull encountered issues. Checking for conflicts..."
-        git status | findstr "conflict" >nul 2>&1
-        if not errorlevel 1 (
-            call :PrintError "Merge conflicts detected! Run 'gitsync conflicts' for help."
-            call :CacheWrite "CONFLICT DETECTED during pull"
-            exit /b 1
-        )
-        call :PrintWarning "Pull failed for another reason. Attempting push anyway..."
-    ) else (
-        call :PrintSuccess "Pull successful."
-        call :CacheWrite "PULL: from origin (before push)"
-    )
-)
-
-:: Get current branch
+:: Get current branch FIRST (needed for both pull and push)
 set "_branch="
 for /f %%b in ('git branch --show-current 2^>nul') do set "_branch=%%b"
 if "!_branch!"=="" (
     for /f %%b in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "_branch=%%b"
 )
 if "!_branch!"=="" set "_branch=%DEFAULT_BRANCH%"
+
+:: Offer to pull first to avoid conflicts
+echo.
+set /p "_pull_first=Pull from remote first to sync? (recommended) (y/n): "
+if /i "!_pull_first!"=="y" (
+    call :PrintStep "Pulling from remote..."
+
+    :: Check if remote branch actually exists before pulling
+    git ls-remote --exit-code --heads origin !_branch! >nul 2>&1
+    if errorlevel 1 (
+        call :PrintInfo "Remote branch does not exist yet — skipping pull (this is your first push)."
+        call :CacheWrite "PULL SKIPPED: remote branch not found, first push"
+    ) else (
+        :: Remote branch exists, safe to pull
+        git pull --rebase origin !_branch!
+        set "_pull_ec=!errorlevel!"
+        if !_pull_ec! EQU 0 (
+            call :PrintSuccess "Pull successful."
+            call :CacheWrite "PULL: from origin (before push)"
+        ) else (
+            :: Check specifically for merge conflicts
+            git status | findstr /i "conflict" >nul 2>&1
+            if not errorlevel 1 (
+                call :PrintError "Merge conflicts detected! Resolve them, then run 'gitsync conflicts' for help."
+                call :CacheWrite "CONFLICT DETECTED during pull"
+                exit /b 1
+            )
+            :: Any other pull failure — warn but continue
+            call :PrintWarning "Pull had an issue (exit code !_pull_ec!). Attempting push anyway..."
+            call :CacheWrite "PULL WARNING: exit code !_pull_ec!, continuing to push"
+        )
+    )
+)
+
 
 call :PrintStep "Pushing to origin/!_branch!..."
 git push -u origin !_branch!
