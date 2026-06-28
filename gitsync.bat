@@ -10,17 +10,30 @@ chcp 65001 >nul 2>&1
 ::  ╚██████╔╝██║   ██║   ███████║   ██║   ██║ ╚████║╚██████╗
 ::   ╚═════╝ ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═══╝ ╚═════╝
 ::
-::        GIT AUTOMATION WIZARD  —  ULTRA EDITION v3.0
+::        GIT AUTOMATION WIZARD  —  ULTRA EDITION v3.1
 ::        Full-featured, failsafe, interactive Git manager
-::        Author  : GitSync Ultra
-::        Version : 3.0.0
-::        Updated : 2025
+::        Author  : ._neutron_.
+::        Version : 3.1.0
+::        Updated : 2026
+:: ============================================================
+::
+:: CHANGELOG v3.1.0
+::   + Self-update check on every startup (fetches latest from GitHub)
+::   + Shows what changed when a new version is downloaded
+::   + Auto-backup of old script before updating
+::   ~ Fixed: ] file created by unescaped > in PrintStep
+::   ~ Fixed: GIT_PAGER=cat prevents pager hang after commits
+::   ~ Fixed: Pull logic now correctly skips pull on first push
+::   ~ Fixed: Branch detected before pull check (was empty before)
+:: END_CHANGELOG
 :: ============================================================
 
 :: ──────────────────────────────────────────────────────────
 ::  GLOBAL CONFIGURATION
 :: ──────────────────────────────────────────────────────────
-set "SCRIPT_VERSION=3.0.0"
+set "SCRIPT_VERSION=3.1.0"
+set "SELF_UPDATE_URL=https://raw.githubusercontent.com/futuretonight/gitsync/main/gitsync.bat"
+set "SELF_UPDATE_SKIP=0"
 set "SCRIPT_NAME=GitSync Ultra"
 set "CACHE_FILE=.gitsync_cache.log"
 set "CONFIG_FILE=.gitsync_config.ini"
@@ -66,6 +79,16 @@ if errorlevel 1 (
 
 :: Capture git version for logs
 for /f "tokens=3" %%v in ('git --version 2^>nul') do set "GIT_VERSION=%%v"
+
+:: ── Load persisted config (e.g. updates_disabled) ────────
+set "UPDATES_DISABLED=0"
+if exist "%CONFIG_FILE%" (
+    for /f "usebackq tokens=1,* delims==" %%k in ("%CONFIG_FILE%") do (
+        if /i "%%k"=="updates_disabled" set "UPDATES_DISABLED=%%l"
+    )
+)
+:: If updates are disabled, tell SelfUpdate to skip
+if "%UPDATES_DISABLED%"=="1" set "SELF_UPDATE_SKIP=1"
 
 :: ──────────────────────────────────────────────────────────
 ::  ARGUMENT / COMMAND ROUTER
@@ -154,6 +177,9 @@ if /i "%ARG1%"=="whoami"        goto :WhoAmI
 
 if /i "%ARG1%"=="sync"          goto :FullSync
 
+if /i "%ARG1%"=="update"        goto :UpdateMenu
+if /i "%ARG1%"=="updates"       goto :UpdateMenu
+
 call :PrintWarning "Unknown command: '%ARG1%'"
 call :PrintInfo    "Run 'gitsync help' to see all available commands."
 exit /b 1
@@ -164,6 +190,8 @@ exit /b 1
 :MainWizard
 cls
 call :PrintBanner
+call :SelfUpdate
+if errorlevel 99 exit /b 0
 call :EnsureCacheFile
 call :EnsureGitIgnore
 call :CheckGitConfig
@@ -237,6 +265,277 @@ exit /b 0
 
 :PrintDim
 echo %C_DIM%    %~1%C_RESET%
+exit /b 0
+
+:: ── Self-update check ───────────────────────────────────────
+:SelfUpdate
+if "%SELF_UPDATE_SKIP%"=="1" exit /b 0
+
+curl --version >nul 2>&1
+if errorlevel 1 ( call :PrintDim "Skipping update check: curl not found." & exit /b 0 )
+
+call :PrintDim "Checking for updates..."
+set "_self=%~f0"
+set "_tmp_update=%TEMP%\gitsync_update_check.bat"
+
+curl -fsSL --connect-timeout 5 --max-time 10 "%SELF_UPDATE_URL%" -o "%_tmp_update%" >nul 2>&1
+if errorlevel 1 (
+    call :PrintDim "Update check skipped: could not reach GitHub."
+    if exist "%_tmp_update%" del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+call :ExtractRemoteVersion "%_tmp_update%"
+if "!_remote_ver!"=="" (
+    call :PrintDim "Update check skipped: remote file has no valid version."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+if "!_remote_ver!"=="%SCRIPT_VERSION%" (
+    call :PrintDim "Already up to date (v%SCRIPT_VERSION%)."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+:: Only prompt if remote is a different valid version
+echo.
+echo %C_BOLD%%C_CYAN%  ╔════════════════════════════════════════════╗%C_RESET%
+echo %C_BOLD%%C_CYAN%  ║  UPDATE AVAILABLE:  v%SCRIPT_VERSION%  →  v!_remote_ver!%C_RESET%
+echo %C_BOLD%%C_CYAN%  ╚════════════════════════════════════════════╝%C_RESET%
+echo.
+echo %C_BOLD%%C_YELLOW%  What's new in v!_remote_ver!:%C_RESET%
+call :PrintChangelog "%_tmp_update%" "!_remote_ver!"
+echo.
+
+set /p "_doupdate=  Install update now? (y/n): "
+if /i not "!_doupdate!"=="y" (
+    call :PrintInfo "Update skipped. You will be asked again next run."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+call :DoInstallUpdate "%_tmp_update%"
+exit /b !errorlevel!
+
+:: ── Extract version from a downloaded bat file ──────────────
+:: Sets _remote_ver to the version string, or empty if not found/invalid
+:ExtractRemoteVersion
+set "_remote_ver="
+set "_evf=%~1"
+for /f "usebackq delims=" %%L in ("%_evf%") do (
+    :: Only process if we haven't found it yet
+    if "!_remote_ver!"=="" (
+        set "_evline=%%L"
+        :: Check line contains both "set" and "SCRIPT_VERSION="
+        set "_evcheck=!_evline!"
+        if "!_evcheck:SCRIPT_VERSION=!=!" neq "!_evcheck!" (
+            if "!_evcheck:set =!=!" neq "!_evcheck!" (
+                :: Extract the part after SCRIPT_VERSION=
+                for /f "tokens=2 delims==" %%v in ("!_evline!") do (
+                    if "!_remote_ver!"=="" set "_remote_ver=%%v"
+                )
+            )
+        )
+    )
+)
+:: Strip quotes and spaces
+set "_remote_ver=!_remote_ver:"=!"
+set "_remote_ver=!_remote_ver: =!"
+:: Validate: must only contain digits and dots (format x.y.z)
+set "_ver_valid=0"
+echo !_remote_ver! | findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul 2>&1
+if not errorlevel 1 set "_ver_valid=1"
+if "!_ver_valid!"=="0" set "_remote_ver="
+exit /b 0
+
+:: ── Print changelog lines from a bat file for a given version ─
+:PrintChangelog
+set "_clf=%~1"
+set "_clver=%~2"
+set "_in_cl=0"
+for /f "usebackq delims=" %%L in ("%_clf%") do (
+    set "_cll=%%L"
+    :: Detect CHANGELOG header for this version
+    echo !_cll! | findstr /i /c:"CHANGELOG v!_clver!" >nul 2>&1
+    if not errorlevel 1 set "_in_cl=1"
+    :: Detect end marker
+    echo !_cll! | findstr /i /c:"END_CHANGELOG" >nul 2>&1
+    if not errorlevel 1 set "_in_cl=0"
+    :: Print content lines (not the header line itself)
+    if "!_in_cl!"=="1" (
+        echo !_cll! | findstr /i /c:"CHANGELOG v" >nul 2>&1
+        if errorlevel 1 (
+            set "_cll=!_cll:::   =  !"
+            set "_cll=!_cll:::  =  !"
+            echo %C_CYAN%!_cll!%C_RESET%
+        )
+    )
+)
+exit /b 0
+
+:: ── Common install routine (backup + replace + restart) ──────
+:DoInstallUpdate
+set "_diu_src=%~1"
+set "_self=%~f0"
+if not exist "%BACKUP_DIR%" mkdir "%BACKUP_DIR%"
+set "_bkdate=%date:~-4%%date:~3,2%%date:~0,2%_%time:~0,2%%time:~3,2%"
+set "_bkdate=!_bkdate: =0!"
+set "_bkfile=%BACKUP_DIR%\gitsync_v%SCRIPT_VERSION%_!_bkdate!.bat"
+copy /y "!_self!" "!_bkfile!" >nul 2>&1
+call :PrintSuccess "Backup saved: !_bkfile!"
+copy /y "%_diu_src%" "!_self!" >nul 2>&1
+if errorlevel 1 (
+    call :PrintError "Update failed: cannot overwrite script. Check file permissions."
+    del /f /q "%_diu_src%" >nul 2>&1
+    exit /b 1
+)
+del /f /q "%_diu_src%" >nul 2>&1
+call :PrintSuccess "Updated to v!_remote_ver! successfully!"
+call :PrintInfo "Restarting GitSync..."
+echo.
+start "" "!_self!"
+exit /b 99
+
+
+:: ── Update menu (gitsync update) ───────────────────────────
+:UpdateMenu
+call :PrintBanner
+echo.
+echo %C_BOLD%%C_BLUE%[ UPDATE MANAGER ]%C_RESET%
+echo %C_DIM%%THIN_DIVIDER%%C_RESET%
+echo.
+echo %C_CYAN%  Current version : %C_BOLD%v%SCRIPT_VERSION%%C_RESET%
+echo %C_CYAN%  Update source   : %C_DIM%%SELF_UPDATE_URL%%C_RESET%
+if "%UPDATES_DISABLED%"=="1" (
+    echo %C_YELLOW%  Auto-updates    : DISABLED%C_RESET%
+) else (
+    echo %C_GREEN%  Auto-updates    : ENABLED%C_RESET%
+)
+echo.
+echo %C_WHITE%  [1] Check for update now (force)%C_RESET%
+if "%UPDATES_DISABLED%"=="1" (
+    echo %C_WHITE%  [2] Re-enable auto-updates%C_RESET%
+) else (
+    echo %C_WHITE%  [2] Disable auto-updates%C_RESET%
+)
+echo %C_WHITE%  [0] Back / Exit%C_RESET%
+echo.
+set /p "_umchoice=  Choice: "
+
+if "!_umchoice!"=="1" (
+    call :UpdateForce
+    goto :UpdateMenu
+)
+if "!_umchoice!"=="2" (
+    call :UpdateToggle
+    goto :UpdateMenu
+)
+if "!_umchoice!"=="0" exit /b 0
+call :PrintWarning "Invalid choice."
+goto :UpdateMenu
+
+:: ── Force update check (on-demand) ─────────────────────────
+:UpdateForce
+echo.
+call :PrintStep "Forcing update check..."
+echo.
+
+curl --version >nul 2>&1
+if errorlevel 1 ( call :PrintError "curl not found. Cannot check for updates." & exit /b 1 )
+
+set "_self=%~f0"
+set "_tmp_update=%TEMP%\gitsync_update_check.bat"
+
+curl -fsSL --connect-timeout 5 --max-time 15 "%SELF_UPDATE_URL%" -o "%_tmp_update%" >nul 2>&1
+if errorlevel 1 (
+    call :PrintError "Could not reach GitHub. Check your internet connection."
+    if exist "%_tmp_update%" del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 1
+)
+
+call :ExtractRemoteVersion "%_tmp_update%"
+
+call :PrintInfo "Local  version : v%SCRIPT_VERSION%"
+if "!_remote_ver!"=="" (
+    call :PrintError "Could not read a valid version from the remote file."
+    call :PrintDim   "The remote may be an old/incompatible version."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 1
+)
+call :PrintInfo "Remote version : v!_remote_ver!"
+echo.
+
+if "!_remote_ver!"=="%SCRIPT_VERSION%" (
+    call :PrintSuccess "Already on the latest version (v%SCRIPT_VERSION%). Nothing to do."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+echo %C_BOLD%%C_CYAN%  ╔════════════════════════════════════════════╗%C_RESET%
+echo %C_BOLD%%C_CYAN%  ║  UPDATE AVAILABLE:  v%SCRIPT_VERSION%  →  v!_remote_ver!%C_RESET%
+echo %C_BOLD%%C_CYAN%  ╚════════════════════════════════════════════╝%C_RESET%
+echo.
+echo %C_BOLD%%C_YELLOW%  What's new in v!_remote_ver!:%C_RESET%
+call :PrintChangelog "%_tmp_update%" "!_remote_ver!"
+echo.
+
+set /p "_doforce=  Install this update now? (y/n): "
+if /i not "!_doforce!"=="y" (
+    call :PrintInfo "Update skipped."
+    del /f /q "%_tmp_update%" >nul 2>&1
+    exit /b 0
+)
+
+call :DoInstallUpdate "%_tmp_update%"
+exit /b !errorlevel!
+
+:: ── Toggle auto-updates on / off (persisted to config) ──────
+:UpdateToggle
+:: Read current state fresh
+set "_cur_disabled=0"
+if exist "%CONFIG_FILE%" (
+    for /f "usebackq tokens=1,* delims==" %%k in ("%CONFIG_FILE%") do (
+        if /i "%%k"=="updates_disabled" set "_cur_disabled=%%l"
+    )
+)
+if "%UPDATES_DISABLED%"=="1" set "_cur_disabled=1"
+
+if "!_cur_disabled!"=="1" (
+    :: Turn updates back ON — remove the line from config
+    if exist "%CONFIG_FILE%" (
+        :: Rewrite config without the updates_disabled line
+        set "_tmp_cfg=%TEMP%\gitsync_cfg_tmp.ini"
+        (for /f "usebackq delims=" %%L in ("%CONFIG_FILE%") do (
+            echo "%%L" | findstr /i "updates_disabled" >nul 2>&1
+            if errorlevel 1 echo %%L
+        )) > "!_tmp_cfg!"
+        copy /y "!_tmp_cfg!" "%CONFIG_FILE%" >nul 2>&1
+        del /f /q "!_tmp_cfg!" >nul 2>&1
+    )
+    set "UPDATES_DISABLED=0"
+    set "SELF_UPDATE_SKIP=0"
+    call :PrintSuccess "Auto-updates ENABLED. Updates will be checked on every startup."
+    call :CacheWrite "UPDATES: re-enabled"
+) else (
+    :: Turn updates OFF — write to config
+    if not exist "%CONFIG_FILE%" (
+        echo # GitSync Ultra config > "%CONFIG_FILE%"
+    )
+    :: Remove any existing entry first, then append
+    set "_tmp_cfg=%TEMP%\gitsync_cfg_tmp.ini"
+    (for /f "usebackq delims=" %%L in ("%CONFIG_FILE%") do (
+        echo "%%L" | findstr /i "updates_disabled" >nul 2>&1
+        if errorlevel 1 echo %%L
+    )) > "!_tmp_cfg!"
+    echo updates_disabled=1 >> "!_tmp_cfg!"
+    copy /y "!_tmp_cfg!" "%CONFIG_FILE%" >nul 2>&1
+    del /f /q "!_tmp_cfg!" >nul 2>&1
+    set "UPDATES_DISABLED=1"
+    set "SELF_UPDATE_SKIP=1"
+    call :PrintSuccess "Auto-updates DISABLED. Run 'gitsync update' and choose [2] to re-enable."
+    call :CacheWrite "UPDATES: disabled"
+)
 exit /b 0
 
 :: ── Write to cache file ────────────────────────────────────
