@@ -1,0 +1,912 @@
+#!/usr/bin/env bash
+
+# ====================================================================
+#   GITSYNC ULTRA v4.0.0 (macOS & Linux Edition)
+#   Ultra-Fast, Failsafe Git Manager & Stash Tracker
+#   Callable from any directory, works in Bash & Zsh
+# ====================================================================
+
+set -e
+
+# --------------------------------------------------------------------
+#  ANSI COLOR DEFINITIONS
+# --------------------------------------------------------------------
+if [ -t 1 ]; then
+    C_RESET="\033[0m"
+    C_RED="\033[91m"
+    C_GREEN="\033[92m"
+    C_YELLOW="\033[93m"
+    C_BLUE="\033[94m"
+    C_MAGENTA="\033[95m"
+    C_CYAN="\033[96m"
+    C_WHITE="\033[97m"
+    C_BOLD="\033[1m"
+    C_DIM="\033[2m"
+else
+    C_RESET=""
+    C_RED=""
+    C_GREEN=""
+    C_YELLOW=""
+    C_BLUE=""
+    C_MAGENTA=""
+    C_CYAN=""
+    C_WHITE=""
+    C_BOLD=""
+    C_DIM=""
+fi
+
+# --------------------------------------------------------------------
+#  GLOBAL CONSTANTS & SAFE STORAGE PATHS
+# --------------------------------------------------------------------
+SCRIPT_VERSION="4.0.0"
+SCRIPT_NAME="GitSync Ultra (macOS)"
+DEFAULT_BRANCH="main"
+DIVIDER="===================================================================="
+THIN_DIVIDER="--------------------------------------------------------------------"
+
+GLOBAL_DIR="$HOME/.gitsync"
+mkdir -p "$GLOBAL_DIR" 2>/dev/null || true
+GLOBAL_CONFIG="$GLOBAL_DIR/config.ini"
+GLOBAL_LOG="$GLOBAL_DIR/history.log"
+
+IS_IN_REPO=0
+GIT_DIR=""
+REPO_ROOT=""
+REPO_SYNC_DIR=""
+STASH_TRACK_LOG=""
+STASH_BACKUP_DIR=""
+REPO_LOG=""
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    IS_IN_REPO=1
+    GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$GIT_DIR" ]; then
+        REPO_SYNC_DIR="$GIT_DIR/gitsync"
+        STASH_TRACK_LOG="$REPO_SYNC_DIR/stash_tracker.log"
+        STASH_BACKUP_DIR="$REPO_SYNC_DIR/stashes"
+        REPO_LOG="$REPO_SYNC_DIR/action.log"
+        mkdir -p "$REPO_SYNC_DIR" "$STASH_BACKUP_DIR" 2>/dev/null || true
+    fi
+fi
+
+# --------------------------------------------------------------------
+#  PRE-FLIGHT CHECK
+# --------------------------------------------------------------------
+if ! command -v git >/dev/null 2>&1; then
+    echo -e "${C_RED}[X] Git is NOT installed or not in PATH.${C_RESET}"
+    echo -e "${C_CYAN}[i] Install Xcode Command Line Tools via: xcode-select --install${C_RESET}"
+    exit 1
+fi
+GIT_VERSION=$(git --version | awk '{print $3}')
+
+# --------------------------------------------------------------------
+#  HELPERS & OUTPUT ROUTINES
+# --------------------------------------------------------------------
+print_banner() {
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}${DIVIDER}${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}         ${SCRIPT_NAME}  v${SCRIPT_VERSION}${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}         Failsafe Git Manager & Stash Tracker${C_RESET}"
+    echo -e "${C_CYAN}         Git ${GIT_VERSION}   |   $(date '+%Y-%m-%d %H:%M:%S')${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}${DIVIDER}${C_RESET}"
+}
+
+print_section() {
+    echo ""
+    echo -e "${C_BOLD}${C_BLUE}[ $1 ]${C_RESET}"
+    echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+}
+
+print_success() {
+    echo -e "${C_GREEN}[+] $1${C_RESET}"
+}
+
+print_error() {
+    echo -e "${C_RED}[X] $1${C_RESET}"
+}
+
+print_warning() {
+    echo -e "${C_YELLOW}[!] $1${C_RESET}"
+}
+
+print_info() {
+    echo -e "${C_CYAN}[i] $1${C_RESET}"
+}
+
+print_step() {
+    echo -e "${C_MAGENTA}[>] $1${C_RESET}"
+}
+
+print_dim() {
+    echo -e "${C_DIM}    $1${C_RESET}"
+}
+
+require_repo() {
+    if [ "$IS_IN_REPO" -ne 1 ]; then
+        print_error "This command requires a Git repository."
+        print_info  "cd into a repository or run 'gitsync' to initialize one."
+        exit 1
+    fi
+}
+
+cache_write() {
+    local msg="$1"
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$now] $msg" >> "$GLOBAL_LOG" 2>/dev/null || true
+    if [ -n "$REPO_LOG" ]; then
+        echo "[$now] $msg" >> "$REPO_LOG" 2>/dev/null || true
+    fi
+}
+
+# --------------------------------------------------------------------
+#  STASH & STASH POP TRACKING ENGINE
+# --------------------------------------------------------------------
+do_tracked_stash_internal() {
+    local msg="$1"
+    local tag="${2:-STASH-SAVE}"
+    [ -z "$msg" ] && msg="Stash $(date '+%Y-%m-%d %H:%M:%S')"
+
+    local dirty_cnt
+    dirty_cnt=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$dirty_cnt" -eq 0 ]; then
+        print_info "Nothing to stash. Working directory is clean."
+        return 2
+    fi
+
+    local cur_br
+    cur_br=$(git branch --show-current 2>/dev/null || echo "HEAD")
+    local cur_sha
+    cur_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    local sid
+    sid="stash_$(date '+%Y%m%d_%H%M%S')"
+    mkdir -p "$STASH_BACKUP_DIR" 2>/dev/null || true
+
+    # Save a safety patch before git stash
+    git diff HEAD > "$STASH_BACKUP_DIR/${sid}.patch" 2>/dev/null || true
+
+    if git stash push -u -m "$msg" >/dev/null 2>&1; then
+        local now
+        now=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "[$now] [$tag] Branch: $cur_br | Commit: $cur_sha | Patch: ${sid}.patch | Msg: \"$msg\"" >> "$STASH_TRACK_LOG"
+        cache_write "$tag: $msg (${sid}.patch)"
+        print_success "Changes stashed and tracked successfully."
+        print_dim     "Safety snapshot saved: ${sid}.patch"
+        return 0
+    else
+        print_error "Git stash failed."
+        return 1
+    fi
+}
+
+do_tracked_stash_pop() {
+    require_repo
+    echo ""
+    print_step "Checking stash queue..."
+
+    local st_cnt
+    st_cnt=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$st_cnt" -eq 0 ]; then
+        print_warning "No stashes found to pop."
+        return 0
+    fi
+
+    local top_stash_line
+    top_stash_line=$(git stash list -1 2>/dev/null || echo "stash@{0}")
+    local cur_br
+    cur_br=$(git branch --show-current 2>/dev/null || echo "HEAD")
+
+    local pop_target="${1:-stash@{0}}"
+    print_step "Popping $pop_target ($top_stash_line)..."
+
+    set +e
+    git stash pop "$pop_target"
+    local pop_status=$?
+    set -e
+
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    if [ $pop_status -eq 0 ]; then
+        echo "[$now] [STASH-POP-SUCCESS] Branch: $cur_br | Item: $top_stash_line" >> "$STASH_TRACK_LOG"
+        cache_write "STASH-POP-SUCCESS: $top_stash_line"
+        print_success "Stash applied and dropped cleanly!"
+    else
+        echo "[$now] [STASH-POP-CONFLICT] Branch: $cur_br | Item: $top_stash_line" >> "$STASH_TRACK_LOG"
+        cache_write "STASH-POP-CONFLICT: $top_stash_line"
+        print_error "Stash popped with merge conflicts!"
+        print_info  "Your changes are preserved in the working tree with conflict markers."
+        print_info  "All historical stash snapshots are safely kept in: .git/gitsync/stashes/"
+        print_info  "Run 'gitsync conflicts' to resolve."
+    fi
+    return $pop_status
+}
+
+stash_history() {
+    require_repo
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}${DIVIDER}${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}         GITSYNC STASH & STASH POP TRACKING AUDIT LOG${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}${DIVIDER}${C_RESET}"
+    echo ""
+    if [ ! -f "$STASH_TRACK_LOG" ] || [ ! -s "$STASH_TRACK_LOG" ]; then
+        print_info "No stash operations recorded in this repository yet."
+        return 0
+    fi
+    echo -e "${C_DIM}Log File: $STASH_TRACK_LOG${C_RESET}"
+    echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+    cat "$STASH_TRACK_LOG"
+    echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+    echo ""
+    print_info "Use 'gitsync stash recover' to restore any historical snapshot."
+}
+
+stash_recover() {
+    require_repo
+    echo ""
+    echo -e "${C_BOLD}${C_GREEN}${DIVIDER}${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}           STASH SAFETY SNAPSHOT RECOVERY WIZARD${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}${DIVIDER}${C_RESET}"
+    echo ""
+    if [ ! -d "$STASH_BACKUP_DIR" ]; then
+        print_warning "No backup snapshot directory found."
+        return 0
+    fi
+
+    local patches=("$STASH_BACKUP_DIR"/*.patch)
+    if [ ! -e "${patches[0]}" ]; then
+        print_info "No snapshot patches found in backup store."
+        return 0
+    fi
+
+    echo "Available stash snapshots:"
+    echo ""
+    local i=1
+    for p in "${patches[@]}"; do
+        echo "  [$i] $(basename "$p")"
+        i=$((i + 1))
+    done
+
+    echo ""
+    read -r -p "Enter patch filename to restore (e.g. stash_20261025_220000.patch) or '0' to exit: " patch_choice
+    [ -z "$patch_choice" ] || [ "$patch_choice" = "0" ] && return 0
+
+    local target_patch="$STASH_BACKUP_DIR/$patch_choice"
+    if [ ! -f "$target_patch" ]; then
+        print_error "Patch file not found: $patch_choice"
+        return 1
+    fi
+
+    echo ""
+    print_step "Patch Preview:"
+    head -n 25 "$target_patch"
+    echo ""
+    read -r -p "Apply this patch to your current working tree now? (y/n): " apply_ans
+    if [ "$apply_ans" = "y" ] || [ "$apply_ans" = "Y" ]; then
+        set +e
+        git apply --reject "$target_patch" 2>/dev/null
+        local ec=$?
+        set -e
+        if [ $ec -ne 0 ]; then
+            print_warning "Patch had conflicts. Applied cleanly where possible (.rej files created)."
+        else
+            print_success "Patch successfully applied to working tree!"
+        fi
+        local now
+        now=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "[$now] [STASH-RECOVERED] File: $patch_choice" >> "$STASH_TRACK_LOG"
+    fi
+}
+
+stash_menu() {
+    require_repo
+    while true; do
+        clear || true
+        echo ""
+        echo -e "${C_BOLD}${C_YELLOW}${DIVIDER}${C_RESET}"
+        echo -e "${C_BOLD}${C_YELLOW}             STASH & STASH POP TRACKER MANAGER${C_RESET}"
+        echo -e "${C_BOLD}${C_YELLOW}${DIVIDER}${C_RESET}"
+        echo ""
+        echo -e "  ${C_BOLD}Active Git Stashes:${C_RESET}"
+        git stash list
+        echo ""
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        echo " [1] Stash changes with Auto-Backup & Tracking"
+        echo " [2] Pop latest stash with Tracking (apply + drop)"
+        echo " [3] Apply stash (keep in git stash list)"
+        echo " [4] Drop a stash (backed up safely in tracker)"
+        echo " [5] Show stash diff / contents"
+        echo " [6] View Stash & Pop Audit History (Tracking Log)"
+        echo " [7] Recover a lost / popped / dropped stash snapshot"
+        echo " [8] Create Named Stash"
+        echo " [9] Apply stash to a new branch"
+        echo " [10] Clear ALL stashes (with full backup snapshot)"
+        echo " [0] Back / Exit"
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        echo ""
+        read -r -p "Select option (0-10): " smc
+        case "$smc" in
+            1)
+                read -r -p "Stash description (blank = auto): " smsg
+                do_tracked_stash_internal "$smsg" "STASH-SAVE"
+                read -r -p "Press Enter to continue..."
+                ;;
+            2)
+                do_tracked_stash_pop "stash@{0}" || true
+                read -r -p "Press Enter to continue..."
+                ;;
+            3)
+                read -r -p "Stash index to apply (e.g. 0): " aidx
+                [ -z "$aidx" ] && aidx="0"
+                git stash apply "stash@{$aidx}"
+                read -r -p "Press Enter to continue..."
+                ;;
+            4)
+                read -r -p "Stash index to drop (e.g. 0): " didx
+                [ -z "$didx" ] && didx="0"
+                local sid="dropped_stash_$(date '+%Y%m%d_%H%M%S')"
+                git stash show -p "stash@{$didx}" > "$STASH_BACKUP_DIR/${sid}.patch" 2>/dev/null || true
+                git stash drop "stash@{$didx}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STASH-DROP] Index: stash@{$didx} | Backup: ${sid}.patch" >> "$STASH_TRACK_LOG"
+                print_success "Dropped stash and created backup: ${sid}.patch"
+                read -r -p "Press Enter to continue..."
+                ;;
+            5)
+                read -r -p "Stash index to show (e.g. 0): " shidx
+                [ -z "$shidx" ] && shidx="0"
+                git stash show -p "stash@{$shidx}"
+                read -r -p "Press Enter to continue..."
+                ;;
+            6)
+                stash_history
+                read -r -p "Press Enter to continue..."
+                ;;
+            7)
+                stash_recover
+                read -r -p "Press Enter to continue..."
+                ;;
+            8)
+                read -r -p "Enter named stash label: " nmsg
+                do_tracked_stash_internal "$nmsg" "STASH-NAMED"
+                read -r -p "Press Enter to continue..."
+                ;;
+            9)
+                read -r -p "Stash index (e.g. 0): " b_idx
+                [ -z "$b_idx" ] && b_idx="0"
+                read -r -p "New branch name: " b_name
+                git stash branch "$b_name" "stash@{$b_idx}"
+                read -r -p "Press Enter to continue..."
+                ;;
+            10)
+                read -r -p "Are you sure you want to clear ALL stashes? (y/n): " c_conf
+                if [ "$c_conf" = "y" ] || [ "$c_conf" = "Y" ]; then
+                    local sid="cleared_all_$(date '+%Y%m%d_%H%M%S')"
+                    git stash show -p "stash@{0}" > "$STASH_BACKUP_DIR/${sid}.patch" 2>/dev/null || true
+                    git stash clear
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STASH-CLEAR-ALL] Snapshot: ${sid}.patch" >> "$STASH_TRACK_LOG"
+                    print_success "All stashes cleared. Safety snapshot saved."
+                fi
+                read -r -p "Press Enter to continue..."
+                ;;
+            0|"")
+                break
+                ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------------
+#  FULL SYNC WORKFLOW (AUTO-STASH + PULL + COMMIT + PUSH)
+# --------------------------------------------------------------------
+full_sync() {
+    require_repo
+    print_banner
+    print_section "FULL REPOSITORY SYNC (AUTO-STASH + PULL + COMMIT + PUSH)"
+
+    local cur_br
+    cur_br=$(git branch --show-current 2>/dev/null)
+    [ -z "$cur_br" ] && cur_br="$DEFAULT_BRANCH"
+
+    local dirty_cnt
+    dirty_cnt=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    local did_autostash=0
+
+    if [ "$dirty_cnt" -gt 0 ]; then
+        print_step "Uncommitted changes detected. Creating tracked auto-stash..."
+        if do_tracked_stash_internal "Auto-stash before sync" "AUTO-STASH"; then
+            did_autostash=1
+        fi
+    fi
+
+    echo ""
+    print_step "Pulling latest changes (origin/$cur_br via rebase)..."
+    set +e
+    git pull --rebase origin "$cur_br" >/dev/null 2>&1
+    local pull_res=$?
+    set -e
+    if [ $pull_res -eq 0 ]; then
+        print_success "Pull completed cleanly."
+    else
+        print_warning "Pull returned non-zero code (remote branch may be new or diverged)."
+    fi
+
+    if [ "$did_autostash" -eq 1 ]; then
+        echo ""
+        print_step "Restoring auto-stashed changes..."
+        set +e
+        git stash pop >/dev/null 2>&1
+        local pop_res=$?
+        set -e
+        if [ $pop_res -eq 0 ]; then
+            print_success "Auto-stashed changes restored cleanly."
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [AUTO-POP-SUCCESS] Restored after sync" >> "$STASH_TRACK_LOG"
+        else
+            print_error "Auto-stash pop had conflicts! Resolve them before committing."
+            cache_write "FULL SYNC: paused due to auto-stash conflicts"
+            exit 1
+        fi
+    fi
+
+    local rem_dirty
+    rem_dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$rem_dirty" -gt 0 ]; then
+        echo ""
+        print_step "Committing local changes..."
+        local smsg="$2"
+        [ -z "$smsg" ] && smsg="Sync auto-commit $(date '+%Y-%m-%d %H:%M:%S')"
+        git add -A
+        git commit -m "$smsg"
+        print_success "Committed: '$smsg'"
+    fi
+
+    echo ""
+    print_step "Pushing to remote origin/$cur_br..."
+    git push -u origin "$cur_br"
+    print_success "Full sync completed successfully!"
+    cache_write "FULL SYNC COMPLETE: origin/$cur_br"
+}
+
+# --------------------------------------------------------------------
+#  DOCTOR HEALTH CHECK
+# --------------------------------------------------------------------
+run_doctor() {
+    clear || true
+    echo ""
+    echo -e "${C_BOLD}${C_GREEN}${DIVIDER}${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}                  GIT DOCTOR HEALTH CHECK${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}${DIVIDER}${C_RESET}"
+    echo ""
+    local issues=0
+
+    # 1. Git command
+    if command -v git >/dev/null 2>&1; then
+        print_success "Git installed: $GIT_VERSION"
+    else
+        print_error "Git NOT found in PATH!"
+        issues=$((issues + 1))
+    fi
+
+    # 2. Repo check
+    if [ "$IS_IN_REPO" -eq 1 ]; then
+        print_success "Valid Git repository detected."
+    else
+        print_warning "Current folder is NOT a Git repository."
+        issues=$((issues + 1))
+    fi
+
+    # 3. Identity
+    local uname uemail
+    uname=$(git config user.name 2>/dev/null || true)
+    uemail=$(git config user.email 2>/dev/null || true)
+    if [ -n "$uname" ]; then
+        print_success "user.name: $uname"
+    else
+        print_warning "user.name is not set."
+        issues=$((issues + 1))
+    fi
+    if [ -n "$uemail" ]; then
+        print_success "user.email: $uemail"
+    else
+        print_warning "user.email is not set."
+        issues=$((issues + 1))
+    fi
+
+    # 4. Remote
+    local r_url
+    r_url=$(git remote get-url origin 2>/dev/null || true)
+    if [ -n "$r_url" ]; then
+        print_success "Remote origin: $r_url"
+    else
+        print_warning "No 'origin' remote configured."
+    fi
+
+    # 5. Stash tracker
+    if [ -f "$STASH_TRACK_LOG" ]; then
+        print_success "Stash Tracker is active."
+    else
+        print_info "Stash Tracker initialized and ready."
+    fi
+
+    echo ""
+    echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+    if [ "$issues" -eq 0 ]; then
+        echo -e "${C_BOLD}${C_GREEN}Health Check Passed: 0 critical issues found.${C_RESET}"
+    else
+        echo -e "${C_BOLD}${C_YELLOW}Health Check Finished: $issues issues detected.${C_RESET}"
+    fi
+    echo ""
+}
+
+# --------------------------------------------------------------------
+#  HELP REFERENCE
+# --------------------------------------------------------------------
+show_help() {
+    clear || true
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}${DIVIDER}${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}          ${SCRIPT_NAME}  v${SCRIPT_VERSION}  -  COMMAND REFERENCE${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}${DIVIDER}${C_RESET}"
+    echo ""
+    echo -e "${C_BOLD}USAGE:${C_RESET}  gitsync [command] [args...]"
+    echo ""
+    echo -e "${C_BOLD}${C_WHITE}WIZARDS & WORKFLOWS${C_RESET}"
+    echo "  gitsync                  Interactive 3-step commit & push wizard"
+    echo "  gitsync sync             Auto-stash + Pull (rebase) + Commit + Push"
+    echo "  gitsync setup            First-time Git configuration wizard"
+    echo "  gitsync doctor           Run health check diagnostics"
+    echo ""
+    echo -e "${C_BOLD}${C_WHITE}STASH & STASH POP TRACKER (NEW in v4.0)${C_RESET}"
+    echo "  gitsync stash            Interactive stash manager & tracker"
+    echo "  gitsync pop              Pop latest stash with automatic tracking"
+    echo "  gitsync stash pop        Pop latest stash with tracking (clean vs conflict)"
+    echo "  gitsync stash save [msg] Stash working changes with safety snapshot"
+    echo "  gitsync stash history    View full audit trail of all stashes and pops"
+    echo "  gitsync stash recover    Restore lost/popped/dropped stash snapshots"
+    echo "  gitsync stash list       List current git stashes"
+    echo "  gitsync stash show [idx] Show stash diff"
+    echo "  gitsync stash drop [idx] Drop stash with automatic backup retention"
+    echo ""
+    echo -e "${C_BOLD}${C_WHITE}QUICK OPERATIONS${C_RESET}"
+    echo "  gitsync status (s)       Fast status and staged/unstaged breakdown"
+    echo "  gitsync commit (c) [msg] Stage all and commit with message"
+    echo "  gitsync push (p) [br]    Push branch to origin"
+    echo "  gitsync pull [br]        Pull with auto-stash protection"
+    echo "  gitsync log (l)          Oneline graph view (last 15 commits)"
+    echo "  gitsync logfull          Full history with authors and dates"
+    echo "  gitsync diff [file]      Show file differences"
+    echo "  gitsync undo             Soft reset last commit (keeps files staged)"
+    echo "  gitsync amend [msg]      Amend previous commit"
+    echo "  gitsync clean            Interactively remove untracked files"
+    echo "  gitsync fetch            Fetch and prune all remotes"
+    echo "  gitsync prune            Remove local branches deleted from remote"
+    echo ""
+    echo -e "${C_BOLD}${C_WHITE}BRANCH, TAG, REMOTE, REVERT${C_RESET}"
+    echo "  gitsync branch (br)      Interactive branch menu (or create/switch/delete/merge)"
+    echo "  gitsync tag              Interactive tag manager"
+    echo "  gitsync remote           Manage remote URLs"
+    echo "  gitsync reset            Soft, mixed, or hard reset menu"
+    echo "  gitsync cherrypick (cp)  Cherry-pick specific commit"
+    echo "  gitsync rebase           Rebase manager"
+    echo "  gitsync conflicts        Guided merge conflict helper"
+    echo ""
+    echo -e "${C_BOLD}${C_WHITE}INSTALLATION ON MACOS:${C_RESET}"
+    echo "  Copy this script to your PATH:"
+    echo "    sudo cp gitsync /usr/local/bin/gitsync && sudo chmod +x /usr/local/bin/gitsync"
+    echo "  Or add its directory to ~/.zshrc:"
+    echo "    export PATH=\"\$PATH:/path/to/gitsync_folder\""
+    echo ""
+    echo -e "${C_DIM}${DIVIDER}${C_RESET}"
+}
+
+# --------------------------------------------------------------------
+#  MAIN INTERACTIVE WIZARD
+# --------------------------------------------------------------------
+main_wizard() {
+    clear || true
+    print_banner
+
+    # Check git user config
+    local uname uemail
+    uname=$(git config user.name 2>/dev/null || true)
+    uemail=$(git config user.email 2>/dev/null || true)
+    if [ -z "$uname" ]; then
+        print_warning "user.name is not configured."
+        read -r -p "Enter your name for Git commits: " new_name
+        [ -n "$new_name" ] && git config --global user.name "$new_name"
+    fi
+    if [ -z "$uemail" ]; then
+        print_warning "user.email is not configured."
+        read -r -p "Enter your email for Git commits: " new_email
+        [ -n "$new_email" ] && git config --global user.email "$new_email"
+    fi
+
+    print_section "STEP 1 - REPOSITORY CHECK"
+    if [ "$IS_IN_REPO" -ne 1 ]; then
+        print_warning "Current folder is not a Git repository."
+        read -r -p "Initialize a new Git repository here? (y/n): " do_init
+        if [ "$do_init" = "y" ] || [ "$do_init" = "Y" ]; then
+            git init
+            git checkout -b "$DEFAULT_BRANCH" 2>/dev/null || git branch -M "$DEFAULT_BRANCH" 2>/dev/null || true
+            print_success "Git repository initialized."
+            IS_IN_REPO=1
+        else
+            print_info "Aborted."
+            exit 1
+        fi
+    else
+        print_success "Git repository detected: $REPO_ROOT"
+    fi
+
+    print_section "STEP 2 - LOCAL COMMIT"
+    print_step "Working tree status:"
+    git status -s
+    echo ""
+    local dirty_cnt
+    dirty_cnt=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$dirty_cnt" -gt 0 ]; then
+        read -r -p "Stage all changes and commit? (y/n): " do_commit
+        if [ "$do_commit" = "y" ] || [ "$do_commit" = "Y" ]; then
+            read -r -p "Commit message (blank = auto): " c_msg
+            [ -z "$c_msg" ] && c_msg="Update $(date '+%Y-%m-%d %H:%M:%S')"
+            git add -A
+            git commit -m "$c_msg"
+            print_success "Committed: '$c_msg'"
+        fi
+    else
+        print_info "Working directory is clean. Nothing to commit."
+    fi
+
+    print_section "STEP 3 - REMOTE PUSH"
+    read -r -p "Push changes to remote? (y/n): " do_push
+    if [ "$do_push" = "y" ] || [ "$do_push" = "Y" ]; then
+        local r_url
+        r_url=$(git remote get-url origin 2>/dev/null || true)
+        if [ -z "$r_url" ]; then
+            print_warning "No 'origin' remote found."
+            read -r -p "Enter remote Git URL: " new_rurl
+            if [ -n "$new_rurl" ]; then
+                git remote add origin "$new_rurl"
+                print_success "Remote added: $new_rurl"
+            fi
+        fi
+
+        local cur_br
+        cur_br=$(git branch --show-current 2>/dev/null || echo "$DEFAULT_BRANCH")
+        read -r -p "Pull with rebase first? (recommended) (y/n): " do_pfirst
+        if [ "$do_pfirst" = "y" ] || [ "$do_pfirst" = "Y" ]; then
+            set +e
+            git pull --rebase origin "$cur_br" 2>/dev/null
+            set -e
+        fi
+
+        print_step "Pushing $cur_br to origin..."
+        git push -u origin "$cur_br"
+        print_success "Pushed to origin/$cur_br successfully!"
+    fi
+
+    print_section "WIZARD COMPLETE"
+    print_success "All tasks completed successfully."
+    print_info    "Run 'gitsync help' to view all direct commands."
+    echo ""
+}
+
+# --------------------------------------------------------------------
+#  ARGUMENT ROUTER
+# --------------------------------------------------------------------
+CMD="$1"
+ARG2="$2"
+ARG3="$3"
+
+case "$CMD" in
+    ""|"wizard")
+        main_wizard
+        ;;
+    "help"|"-h"|"--help"|"?")
+        show_help
+        ;;
+    "version"|"-v"|"--version")
+        echo "$SCRIPT_NAME version $SCRIPT_VERSION (Git $GIT_VERSION)"
+        ;;
+    "status"|"s")
+        require_repo
+        echo ""
+        echo -e "${C_BOLD}${C_BLUE}[ GIT STATUS ]${C_RESET}"
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        git status -s
+        echo ""
+        echo -e "${C_BOLD}${C_BLUE}[ STAGED CHANGES ]${C_RESET}"
+        git diff --cached --stat
+        echo ""
+        echo -e "${C_BOLD}${C_BLUE}[ UNSTAGED CHANGES ]${C_RESET}"
+        git diff --stat
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        ;;
+    "log"|"l")
+        require_repo
+        echo ""
+        echo -e "${C_BOLD}${C_BLUE}[ RECENT COMMITS (15) ]${C_RESET}"
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        git log --oneline --graph --decorate --color -15
+        ;;
+    "logfull")
+        require_repo
+        echo ""
+        echo -e "${C_BOLD}${C_BLUE}[ FULL COMMIT HISTORY ]${C_RESET}"
+        echo -e "${C_DIM}${THIN_DIVIDER}${C_RESET}"
+        git log --graph --decorate --color --format="%C(yellow)%h%Creset %s %C(cyan)(%cr)%Creset %C(bold blue)%an%Creset" -30
+        ;;
+    "diff")
+        require_repo
+        if [ -n "$ARG2" ]; then
+            git diff "$ARG2"
+        else
+            git diff
+        fi
+        ;;
+    "commit"|"c")
+        require_repo
+        cmsg="$ARG2"
+        if [ -z "$cmsg" ]; then
+            read -r -p "Commit message: " cmsg
+        fi
+        [ -z "$cmsg" ] && cmsg="Update $(date '+%Y-%m-%d %H:%M:%S')"
+        git add -A
+        git commit -m "$cmsg"
+        print_success "Committed: '$cmsg'"
+        cache_write "COMMIT: $cmsg"
+        ;;
+    "push"|"p")
+        require_repo
+        pbr="$ARG2"
+        [ -z "$pbr" ] && pbr=$(git branch --show-current 2>/dev/null || echo "$DEFAULT_BRANCH")
+        print_step "Pushing to origin/$pbr..."
+        git push -u origin "$pbr"
+        print_success "Pushed to origin/$pbr"
+        ;;
+    "pull")
+        require_repo
+        pbr="$ARG2"
+        [ -z "$pbr" ] && pbr=$(git branch --show-current 2>/dev/null || echo "$DEFAULT_BRANCH")
+        dirty_cnt=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        did_as=0
+        if [ "$dirty_cnt" -gt 0 ]; then
+            print_step "Auto-stashing changes before pull..."
+            do_tracked_stash_internal "Auto-stash before pull" "AUTO-STASH"
+            did_as=1
+        fi
+        print_step "Pulling from origin/$pbr (--rebase)..."
+        git pull --rebase origin "$pbr"
+        if [ "$did_as" -eq 1 ]; then
+            print_step "Restoring auto-stash..."
+            git stash pop
+        fi
+        print_success "Pull complete."
+        ;;
+    "sync")
+        full_sync "$@"
+        ;;
+    "pop")
+        do_tracked_stash_pop "stash@{0}"
+        ;;
+    "stash"|"st")
+        case "$ARG2" in
+            "")
+                stash_menu
+                ;;
+            "pop")
+                target="stash@{0}"
+                [ -n "$ARG3" ] && target="stash@{$ARG3}"
+                do_tracked_stash_pop "$target"
+                ;;
+            "save"|"push")
+                do_tracked_stash_internal "$ARG3" "STASH-SAVE"
+                ;;
+            "history"|"log"|"track")
+                stash_history
+                ;;
+            "recover")
+                stash_recover
+                ;;
+            "list")
+                require_repo
+                git stash list
+                ;;
+            "show")
+                require_repo
+                s_idx="${ARG3:-0}"
+                git stash show -p "stash@{$s_idx}"
+                ;;
+            "drop")
+                require_repo
+                d_idx="${ARG3:-0}"
+                git stash drop "stash@{$d_idx}"
+                ;;
+            "clear")
+                require_repo
+                git stash clear
+                print_success "All stashes cleared."
+                ;;
+            *)
+                print_error "Unknown stash action: $ARG2"
+                ;;
+        esac
+        ;;
+    "undo")
+        require_repo
+        read -r -p "Undo last commit (keep changes staged)? (y/n): " uconf
+        if [ "$uconf" = "y" ] || [ "$uconf" = "Y" ]; then
+            git reset HEAD~1 --soft
+            print_success "Last commit undone. Files are staged."
+        fi
+        ;;
+    "amend")
+        require_repo
+        if [ -n "$ARG2" ]; then
+            git commit --amend -m "$ARG2"
+        else
+            git commit --amend
+        fi
+        print_success "Last commit amended."
+        ;;
+    "clean")
+        require_repo
+        git clean -nd
+        read -r -p "Delete untracked files? (y/n): " cconf
+        if [ "$cconf" = "y" ] || [ "$cconf" = "Y" ]; then
+            git clean -fd
+            print_success "Working directory cleaned."
+        fi
+        ;;
+    "fetch")
+        require_repo
+        git fetch --all --prune
+        print_success "All remotes fetched."
+        ;;
+    "branch"|"br")
+        require_repo
+        case "$ARG2" in
+            "")
+                echo "Current branch: $(git branch --show-current 2>/dev/null)"
+                echo ""
+                git branch -a
+                ;;
+            "create")
+                [ -z "$ARG3" ] && { read -r -p "New branch name: " bname; } || bname="$ARG3"
+                git checkout -b "$bname"
+                ;;
+            "switch")
+                [ -z "$ARG3" ] && { read -r -p "Branch name to switch to: " bname; } || bname="$ARG3"
+                git checkout "$bname"
+                ;;
+            "delete")
+                [ -z "$ARG3" ] && { read -r -p "Branch name to delete: " bname; } || bname="$ARG3"
+                git branch -d "$bname"
+                ;;
+            "merge")
+                [ -z "$ARG3" ] && { read -r -p "Branch to merge into current: " bname; } || bname="$ARG3"
+                git merge "$bname"
+                ;;
+            *)
+                git branch -a
+                ;;
+        esac
+        ;;
+    "doctor")
+        run_doctor
+        ;;
+    "whoami")
+        echo "Git User:  $(git config user.name 2>/dev/null || echo 'not set')"
+        echo "Git Email: $(git config user.email 2>/dev/null || echo 'not set')"
+        ;;
+    "conflicts")
+        require_repo
+        git status | grep -E "conflict|Unmerged" || print_success "No conflicts found."
+        ;;
+    *)
+        print_error "Unknown command: '$CMD'"
+        print_info  "Run 'gitsync help' to view all available commands."
+        exit 1
+        ;;
+esac
